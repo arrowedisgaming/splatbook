@@ -98,6 +98,9 @@ see the pack's LICENSE.md).
     (it lives in `$HOME`, a real filesystem) — only the bind-mount itself
     needs redoing each `unshare` session, so build it once per session, bind
     it every time.
+  `src/lib/server/card-tables/d1.test.ts` starts workerd (through Miniflare),
+  another mac-arm64 binary on that share. Run with `NO_WORKERD=1` to skip that
+  one file there; CI runs it.
   If none of this is available (no `unshare`, no build toolchain), say so,
   skip the affected local runs, and rely on CI (push → GitHub Actions runs
   the full suite on real Linux) as the verification path.

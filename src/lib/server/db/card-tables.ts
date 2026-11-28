@@ -21,7 +21,15 @@
 
 import { and, asc, count, desc, eq, getTableColumns, gte, inArray, lt, sql } from 'drizzle-orm';
 import type { Db } from './entities.ts';
-import { cardTables, cardTableSeats, type CardTableRow, type CardTableSeat } from './schema.ts';
+import {
+	cardTableEvents,
+	cardTables,
+	cardTableSeats,
+	type CardTableEvent,
+	type CardTableRow,
+	type CardTableSeat
+} from './schema.ts';
+import { readTogether } from './read-together.ts';
 import { MAX_COMMANDS_PER_TABLE, MAX_TABLES_PER_OWNER } from '../../card-table-limits.ts';
 
 /** Six weeks, in milliseconds — the retention window, matching Crawlspace. */
@@ -125,6 +133,72 @@ export async function getCardTableByToken(
 	const [row] = await db.select().from(cardTables).where(eq(cardTables.roomToken, token)).limit(1);
 	if (!row || isExpired(row, now)) return undefined;
 	return row;
+}
+
+/** A table, everybody at it, and whether a given request has run before. */
+export interface TableWithSeats {
+	row: CardTableRow;
+	/** Oldest first, the same order as `listSeats`. */
+	seats: CardTableSeat[];
+	/**
+	 * The event a request hash already produced at this table. `null` when the
+	 * hash was looked for and is not there; `undefined` when nobody asked.
+	 */
+	prior: CardTableEvent | null | undefined;
+}
+
+/**
+ * The table a token names, with its seats, in one trip to the database.
+ *
+ * Everything that acts on a table needs both: the row for its state, the seats
+ * to know who is asking. They were two queries, the second waiting on the id
+ * the first returned. Here the seats are found by the token as well, through a
+ * subquery, so neither needs the other's answer and `readTogether` can send
+ * them as one request on D1 (issue #2).
+ *
+ * A command also has to know whether its request hash has been seen, which is
+ * a third read with the same shape, so passing a `requestHash` adds it to the
+ * same trip. It is a lookup and not the lock: the unique index is still what
+ * stops a command landing twice (see `applyCommand`).
+ *
+ * Not a join, unlike `peekTableByToken`, because this one does carry the
+ * state, and a join would repeat that blob on every seat's row.
+ *
+ * Read-only, and an expired table reads as absent, like `getCardTableByToken`.
+ */
+export async function getTableWithSeatsByToken(
+	db: Db,
+	token: string,
+	requestHash?: string,
+	now: number = Date.now()
+): Promise<TableWithSeats | undefined> {
+	const theTable = db
+		.select({ id: cardTables.id })
+		.from(cardTables)
+		.where(eq(cardTables.roomToken, token));
+	const table = db.select().from(cardTables).where(eq(cardTables.roomToken, token)).limit(1);
+	const seated = db
+		.select()
+		.from(cardTableSeats)
+		.where(inArray(cardTableSeats.tableId, theTable))
+		.orderBy(asc(cardTableSeats.createdAt));
+
+	if (requestHash === undefined) {
+		const [[row], seats] = await readTogether(db, [table, seated]);
+		if (!row || isExpired(row, now)) return undefined;
+		return { row, seats, prior: undefined };
+	}
+
+	const seen = db
+		.select()
+		.from(cardTableEvents)
+		.where(
+			and(inArray(cardTableEvents.tableId, theTable), eq(cardTableEvents.requestHash, requestHash))
+		)
+		.limit(1);
+	const [[row], seats, [prior]] = await readTogether(db, [table, seated, seen]);
+	if (!row || isExpired(row, now)) return undefined;
+	return { row, seats, prior: prior ?? null };
 }
 
 /** What a poll needs to decide whether anything has changed. */

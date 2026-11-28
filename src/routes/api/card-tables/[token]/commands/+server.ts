@@ -25,12 +25,18 @@ const body = z.strictObject({
 
 export const POST: RequestHandler = async ({ locals, params, request, fetch }) => {
 	const session = await locals.auth();
+	// The body is read first so that the table, its seats and whether this
+	// request has run before can all be asked for in one trip to the database.
+	// A body that does not parse is still refused last, below: whether the
+	// table exists and whether the caller sits at it are answered first.
+	const parsed = body.safeParse(await request.json().catch(() => null));
 	const table = await loadTable(
 		locals.db,
 		fetch,
 		params.token,
 		locals.seatClaims[params.token],
-		session?.user?.id
+		session?.user?.id,
+		parsed.success ? parsed.data.requestHash : undefined
 	);
 	if (!table) error(404, 'No such table.');
 
@@ -38,7 +44,6 @@ export const POST: RequestHandler = async ({ locals, params, request, fetch }) =
 	// on the GM can watch and cannot act.
 	if (!table.seat || table.seat.status !== 'admitted') error(403, 'You have no seat here.');
 
-	const parsed = body.safeParse(await request.json().catch(() => null));
 	if (!parsed.success) error(400, 'Malformed command.');
 
 	const result = await runCommand(

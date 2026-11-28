@@ -20,6 +20,7 @@ import {
 	expireByToken,
 	getCardTable,
 	getCardTableByToken,
+	getTableWithSeatsByToken,
 	listCardTablesForOwner,
 	listSeats,
 	rotateRoomToken,
@@ -157,6 +158,60 @@ describe('the limits', () => {
 			ok: false,
 			reason: 'exhausted'
 		});
+	});
+});
+
+describe('finding a table and its seats together', () => {
+	const sit = async (tableId: string, name: string, createdAt: number) => {
+		const [seat] = await db
+			.insert(schema.cardTableSeats)
+			.values({ tableId, name, status: 'admitted', createdAt: new Date(createdAt) })
+			.returning();
+		return seat;
+	};
+
+	it('gives the row and the seats in the order they sat down', async () => {
+		const row = await make();
+		await sit(row.id, 'Second', 2000);
+		await sit(row.id, 'First', 1000);
+
+		const found = await getTableWithSeatsByToken(db, row.roomToken);
+		expect(found?.row).toEqual(row);
+		expect(found?.seats.map((s) => s.name)).toEqual(['First', 'Second']);
+		// Nobody asked about a request, so there is no answer either way.
+		expect(found?.prior).toBeUndefined();
+	});
+
+	it('keeps each table to its own seats', async () => {
+		const row = await make();
+		const other = await make('Another game');
+		await sit(other.id, 'Elsewhere', 1000);
+		expect((await getTableWithSeatsByToken(db, row.roomToken))?.seats).toEqual([]);
+	});
+
+	it('says whether a request has run before, when asked', async () => {
+		const row = await make();
+		const other = await make('Another game');
+		const [event] = await db
+			.insert(schema.cardTableEvents)
+			.values({ tableId: row.id, version: 1, kind: 'move', requestHash: 'seen-before' })
+			.returning();
+
+		expect((await getTableWithSeatsByToken(db, row.roomToken, 'seen-before'))?.prior).toEqual(
+			event
+		);
+		// Looked for and absent is `null`, which is not the same as not looking.
+		expect((await getTableWithSeatsByToken(db, row.roomToken, 'brand-new'))?.prior).toBeNull();
+		// A request key belongs to its table.
+		expect((await getTableWithSeatsByToken(db, other.roomToken, 'seen-before'))?.prior).toBeNull();
+	});
+
+	it('says nothing for a token that was never issued, or a table that has expired', async () => {
+		expect(await getTableWithSeatsByToken(db, 'not-a-token', 'r')).toBeUndefined();
+		const row = await make();
+		await touchCardTable(db, row.id, Date.now() - TABLE_RETENTION_MS - 1000);
+		expect(await getTableWithSeatsByToken(db, row.roomToken)).toBeUndefined();
+		expect(await getTableWithSeatsByToken(db, row.roomToken, 'r')).toBeUndefined();
 	});
 });
 

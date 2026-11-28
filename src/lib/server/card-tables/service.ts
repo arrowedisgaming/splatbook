@@ -15,12 +15,11 @@ import { getGame } from '$lib/games';
 import {
 	expireByToken,
 	getCardTable,
-	getCardTableByToken,
+	getTableWithSeatsByToken,
 	peekTableByToken,
 	touchCardTable,
 	sweepExpiredTables
 } from '../db/card-tables';
-import { listSeats } from '../db/card-tables';
 import { seatAmong } from '../db/card-table-seats';
 import { applyCommand, eventsSince } from '../db/card-table-commands';
 /**
@@ -98,6 +97,11 @@ export interface TableContext {
 	/** The engine state, migrated and with its seats reconciled. */
 	state: unknown;
 	stateVersion: number;
+	/**
+	 * Whether the request hash `loadTable` was given has run at this table: the
+	 * event it produced, or `null`. Absent when no hash was given.
+	 */
+	prior?: CardTableEvent | null;
 }
 
 /**
@@ -106,25 +110,31 @@ export interface TableContext {
  * Returns nothing for a token that names no table, or one that has expired —
  * expiry is a read-time judgement rather than a scheduled deletion, so the poll
  * path never writes.
+ *
+ * One trip to the database for the row and the seats together. A request that
+ * is about to run a command passes its `requestHash`, and whether that request
+ * has run before comes back in the same trip, as `prior`.
  */
 export async function loadTable(
 	db: Db,
 	fetchFn: typeof fetch,
 	token: string,
 	claim: SeatClaim | undefined,
-	userId: string | undefined
+	userId: string | undefined,
+	requestHash?: string
 ): Promise<TableContext | undefined> {
-	const row = await getCardTableByToken(db, token);
-	if (!row) return undefined;
+	const found = await getTableWithSeatsByToken(db, token, requestHash);
+	if (!found) return undefined;
+	const { row, seats, prior } = found;
 
 	const module = cardTableOf(row.gameId);
 	if (!module) return undefined;
 
-	const seats = await listSeats(db, row.id);
 	// From the seats just loaded rather than a query of its own: the viewer's
 	// seat is one of those rows, and asking again was a round trip for nothing.
 	const seat = await seatAmong(seats, claim, userId);
-	return contextFor(fetchFn, row, module, seats, seat);
+	const ctx = await contextFor(fetchFn, row, module, seats, seat);
+	return prior === undefined ? ctx : { ...ctx, prior };
 }
 
 /** Assemble a request's view of a table from rows already in hand. */
@@ -316,7 +326,7 @@ export async function runCommand(
 			actorSeatId: ctx.seat?.id ?? null,
 			expectedVersion,
 			requestHash,
-			loaded: ctx.row
+			loaded: { table: ctx.row, prior: ctx.prior }
 		},
 		(stored) => {
 			// A command never lands on a shape the game has not seen: it reduces

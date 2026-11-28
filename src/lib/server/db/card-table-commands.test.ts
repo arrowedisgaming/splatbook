@@ -114,7 +114,7 @@ describe('applying a command', () => {
 		const loaded = (await getCardTable(db, tableId))!;
 		await run({ requestHash: 'a' });
 
-		const loser = await run({ requestHash: 'b', expectedVersion: 0, loaded });
+		const loser = await run({ requestHash: 'b', expectedVersion: 0, loaded: { table: loaded } });
 		expect(loser).toMatchObject({ ok: false, reason: 'conflict' });
 		expect((await getCardTable(db, tableId))?.state).toEqual({ moves: 1 });
 		expect(await eventsSince(db, tableId, 0)).toHaveLength(1);
@@ -127,9 +127,41 @@ describe('applying a command', () => {
 		await run({ requestHash: 'a' });
 
 		// The client has caught up to version 1; the caller's row has not.
-		const second = await run({ requestHash: 'b', expectedVersion: 1, loaded });
+		const second = await run({ requestHash: 'b', expectedVersion: 1, loaded: { table: loaded } });
 		expect(second.ok).toBe(true);
 		expect((await getCardTable(db, tableId))?.state).toEqual({ moves: 2 });
+	});
+
+	it('replays from a lookup its caller already made', async () => {
+		const first = await run({ requestHash: 'a' });
+		if (!first.ok) throw new Error(first.reason);
+		const table = (await getCardTable(db, tableId))!;
+
+		// The retry arrives still believing in version 0. The event is a settled
+		// answer whatever the versions say, and nothing is applied a second time.
+		const again = await run({
+			requestHash: 'a',
+			expectedVersion: 0,
+			loaded: { table, prior: first.event }
+		});
+		expect(again).toMatchObject({ ok: true, replayed: true });
+		expect((await getCardTable(db, tableId))?.state).toEqual({ moves: 1 });
+	});
+
+	it('still refuses a duplicate that landed after its caller looked', async () => {
+		// The caller looked, found nothing, and was told so. Then the same request
+		// landed from elsewhere. The lookup was never the lock.
+		const table = (await getCardTable(db, tableId))!;
+		await run({ requestHash: 'a' });
+
+		const late = await run({
+			requestHash: 'a',
+			expectedVersion: 0,
+			loaded: { table, prior: null }
+		});
+		expect(late).toMatchObject({ ok: true, replayed: true });
+		expect((await getCardTable(db, tableId))?.state).toEqual({ moves: 1 });
+		expect(await eventsSince(db, tableId, 0)).toHaveLength(1);
 	});
 
 	it('passes a refusal through without writing', async () => {

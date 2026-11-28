@@ -53,7 +53,7 @@ export interface ApplyCommandInput {
 	 */
 	requestHash: string;
 	/**
-	 * The table's row as the caller has just read it, if it has.
+	 * What the caller has just read about this table, if it has.
 	 *
 	 * A route loads the table to find out who is asking before it can run
 	 * anything, so by the time a command gets here the row has usually been read
@@ -65,8 +65,15 @@ export interface ApplyCommandInput {
 	 * command landed after the caller's read, the write matches nothing and this
 	 * is the ordinary `conflict`. A row at any other version is ignored and the
 	 * stored one read, exactly as when none is given.
+	 *
+	 * `prior` is the caller's own lookup of the request hash, made in the same
+	 * trip as the row (`getTableWithSeatsByToken`): the event if this request has
+	 * run before, `null` if it looked and found none, absent if it did not look.
+	 * An event is a settled answer whatever the versions say. A `null` saves the
+	 * lookup here and weakens nothing, because the lookup was never the lock:
+	 * a duplicate that lands after it still loses on the unique index.
 	 */
-	loaded?: CardTableRow;
+	loaded?: { table: CardTableRow; prior?: CardTableEvent | null };
 }
 
 /** A claimed-but-not-yet-finished event carries this instead of a version. */
@@ -93,13 +100,15 @@ export async function applyCommand(
 	input: ApplyCommandInput,
 	reduce: (state: unknown) => CommandOutcome
 ): Promise<ApplyResult> {
-	const table =
-		input.loaded?.version === input.expectedVersion
-			? input.loaded
-			: await getCardTable(db, input.tableId);
+	const loaded = input.loaded;
+	if (loaded?.prior) return replayOf(loaded.table, loaded.prior);
+
+	const current = loaded?.table.version === input.expectedVersion ? loaded : undefined;
+	const table = current?.table ?? (await getCardTable(db, input.tableId));
 	if (!table) return { ok: false, reason: 'no-such-table' };
 
-	const existing = await findByRequest(db, input.tableId, input.requestHash);
+	const existing =
+		current?.prior === null ? undefined : await findByRequest(db, input.tableId, input.requestHash);
 	if (existing) return replayOf(table, existing);
 
 	// Reduce before claiming: the reducer is pure, so a refusal costs nothing

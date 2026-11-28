@@ -25,7 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - saving the new state no longer hands the whole state back to be parsed
     again;
   - the reply carries the event the command just wrote, instead of reading it
-    back from the log.
+    back from the log;
+  - the table, its seats and whether the request has run before are read in
+    one trip to D1 (`readTogether`, after guild-book's `readIndependently`),
+    not three. A table page and a picture upload load their table the same way.
+
+  That is four trips to the database for a command, down from eight.
+  `src/lib/server/card-tables/d1.test.ts` runs the table against a real local
+  D1 and holds the count as a budget; set `NO_WORKERD=1` to skip it where
+  workerd cannot run.
 
 - **A fresh Worker's first request is light enough for Workers Free.** Session
   14's 1102 was most likely a new isolate's first request: Wrangler's bundle

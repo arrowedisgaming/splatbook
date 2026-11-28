@@ -190,6 +190,21 @@ describe('running a command', () => {
 		expect(statements.filter((q) => /^select .* from "card_tables"/i.test(q))).toEqual([]);
 	});
 
+	it('learns in its first trip that a retried command has already run', async () => {
+		const move = { type: 'move', from: { zone: 'deck:player' }, to: 'discard:player' };
+		const first = await runCommand(db, (await load(packFetch()))!, move, 0, 'req-1', seededRng(1));
+		expect(first.ok).toBe(true);
+
+		// The retry: same key, and a client that never heard the first answer.
+		statements.length = 0;
+		const ctx = (await loadTable(db, packFetch().fn, token, undefined, undefined, 'req-1'))!;
+		const again = await runCommand(db, ctx, move, 0, 'req-1', seededRng(1));
+		expect(again).toMatchObject({ ok: true, replayed: true });
+		// The table, its seats and the earlier event. Nothing is written.
+		expect(statements).toHaveLength(3);
+		expect(statements.filter((q) => !/^select/i.test(q))).toEqual([]);
+	});
+
 	it('leaves the state the request loaded exactly as it was', async () => {
 		const ctx = (await load(packFetch()))!;
 		const before = JSON.stringify(ctx.state);
