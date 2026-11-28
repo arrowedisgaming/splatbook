@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Smith's aces: a stemmed cup, a coin with the star cut out, an upright sword
   and a leafed wand. Same files, same single ink colour, so the card table and
   the suit tables in the rules pick them up with no other change.
+- **A card-table command does less database work**
+  ([#2](https://github.com/blockbeard/splatbook/issues/2)). Commands were
+  usually 11 ms of CPU on Cloudflare against Workers Free's 10 ms, and close to
+  half of that was the database layer: eight queries, with the table's state
+  parsed three times. So far:
+  - a command reduces from the table the request has already loaded, when the
+    client is up to date, instead of reading and migrating it a second time;
+  - saving the new state no longer hands the whole state back to be parsed
+    again.
+
 - **A fresh Worker's first request is light enough for Workers Free.** Session
   14's 1102 was most likely a new isolate's first request: Wrangler's bundle
   loads each module the first time a request needs it, and the first request of

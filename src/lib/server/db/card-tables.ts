@@ -19,7 +19,7 @@
  * Server-only.
  */
 
-import { and, asc, count, desc, eq, gte, inArray, lt, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, getTableColumns, gte, inArray, lt, sql } from 'drizzle-orm';
 import type { Db } from './entities.ts';
 import { cardTables, cardTableSeats, type CardTableRow, type CardTableSeat } from './schema.ts';
 import { MAX_COMMANDS_PER_TABLE, MAX_TABLES_PER_OWNER } from '../../card-table-limits.ts';
@@ -372,6 +372,17 @@ export type SaveRefusal =
 
 export type SaveResult = { ok: true; table: CardTableRow } | { ok: false; reason: SaveRefusal };
 
+/**
+ * Every column of a table but its state, for a write to hand back.
+ *
+ * The caller of `saveTableState` is holding the state it just asked to have
+ * stored. Returning the whole row made the database serialise that blob again
+ * and the driver parse it again, on every command, to produce an object equal
+ * to the one already in hand (issue #2).
+ */
+const { state: _unreturned, ...savedColumns } = getTableColumns(cardTables);
+void _unreturned;
+
 export async function saveTableState(
 	db: Db,
 	id: string,
@@ -402,8 +413,8 @@ export async function saveTableState(
 				lt(cardTables.commandCount, MAX_COMMANDS_PER_TABLE)
 			)
 		)
-		.returning();
-	if (row) return { ok: true, table: row };
+		.returning(savedColumns);
+	if (row) return { ok: true, table: { ...row, state } };
 
 	// Nothing matched. One read to say why, so a caller can tell a race worth
 	// retrying from a table it should stop asking about.

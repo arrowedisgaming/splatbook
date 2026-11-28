@@ -174,6 +174,39 @@ describe('running a command', () => {
 		expect(JSON.stringify(res.event.data)).not.toMatch(/swords|cups|wands|pentacles/);
 	});
 
+	it('does not read the table again when the client is up to date', async () => {
+		const ctx = (await load(packFetch()))!;
+		statements.length = 0;
+		const res = await runCommand(
+			db,
+			ctx,
+			{ type: 'move', from: { zone: 'deck:player' }, to: 'discard:player' },
+			0,
+			'req-1',
+			seededRng(1)
+		);
+		expect(res.ok).toBe(true);
+		// The row the request loaded is the row the command builds on.
+		expect(statements.filter((q) => /^select .* from "card_tables"/i.test(q))).toEqual([]);
+	});
+
+	it('leaves the state the request loaded exactly as it was', async () => {
+		const ctx = (await load(packFetch()))!;
+		const before = JSON.stringify(ctx.state);
+		const res = await runCommand(
+			db,
+			ctx,
+			{ type: 'move', from: { zone: 'deck:player' }, to: 'discard:player' },
+			0,
+			'req-1',
+			seededRng(1)
+		);
+		expect(res.ok).toBe(true);
+		// The route compares before and after (which picture the scene shows), so
+		// reducing from the loaded state must not be reducing *into* it.
+		expect(JSON.stringify(ctx.state)).toBe(before);
+	});
+
 	it('reduces from the stored state, not the one the request loaded', async () => {
 		const ctx = (await load(packFetch()))!;
 		await runCommand(

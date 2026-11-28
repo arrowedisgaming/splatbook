@@ -52,6 +52,21 @@ export interface ApplyCommandInput {
 	 * The unique index does the enforcing; this is only the key.
 	 */
 	requestHash: string;
+	/**
+	 * The table's row as the caller has just read it, if it has.
+	 *
+	 * A route loads the table to find out who is asking before it can run
+	 * anything, so by the time a command gets here the row has usually been read
+	 * once already. When that row is at the version the client expects, it is
+	 * the row this would read, and reading it again was a round trip and a
+	 * second parse of the whole state for nothing (issue #2).
+	 *
+	 * Trusting it is safe because the save is conditional on the version: if a
+	 * command landed after the caller's read, the write matches nothing and this
+	 * is the ordinary `conflict`. A row at any other version is ignored and the
+	 * stored one read, exactly as when none is given.
+	 */
+	loaded?: CardTableRow;
 }
 
 /** A claimed-but-not-yet-finished event carries this instead of a version. */
@@ -78,7 +93,10 @@ export async function applyCommand(
 	input: ApplyCommandInput,
 	reduce: (state: unknown) => CommandOutcome
 ): Promise<ApplyResult> {
-	const table = await getCardTable(db, input.tableId);
+	const table =
+		input.loaded?.version === input.expectedVersion
+			? input.loaded
+			: await getCardTable(db, input.tableId);
 	if (!table) return { ok: false, reason: 'no-such-table' };
 
 	const existing = await findByRequest(db, input.tableId, input.requestHash);

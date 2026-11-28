@@ -288,6 +288,9 @@ export async function runCommand(
 	/** Injectable for tests; production takes the platform's own randomness. */
 	rng?: () => number
 ) {
+	const admitted = ctx.seats
+		.filter((s) => s.status === 'admitted')
+		.map((s) => ({ id: s.id, isGm: s.isGm }));
 	let applied: unknown;
 	const result = await applyCommand(
 		db,
@@ -295,17 +298,20 @@ export async function runCommand(
 			tableId: ctx.row.id,
 			actorSeatId: ctx.seat?.id ?? null,
 			expectedVersion,
-			requestHash
+			requestHash,
+			loaded: ctx.row
 		},
 		(stored) => {
-			// Reduce from the *stored* state migrated and seat-reconciled, so a
-			// command never lands on a shape the game has not seen.
-			const migrated = ctx.module.migrate(stored, ctx.pack);
-			const admitted = ctx.seats
-				.filter((s) => s.status === 'admitted')
-				.map((s) => ({ id: s.id, isGm: s.isGm }));
-			const synced = ctx.module.syncSeats(migrated.state, admitted);
-			const outcome = ctx.module.reduce(synced, command, {
+			// A command never lands on a shape the game has not seen: it reduces
+			// from state that has been migrated and had its seats reconciled. When
+			// the shell reduces from the very row this request loaded, that work is
+			// already done and is `ctx.state`. When it had to read a newer row, the
+			// context is stale and the stored state is prepared here instead.
+			const prepared =
+				stored === ctx.row.state
+					? ctx.state
+					: ctx.module.syncSeats(ctx.module.migrate(stored, ctx.pack).state, admitted);
+			const outcome = ctx.module.reduce(prepared, command, {
 				actorSeatId: ctx.seat?.id ?? null,
 				rng: rng ?? cryptoRng
 			});

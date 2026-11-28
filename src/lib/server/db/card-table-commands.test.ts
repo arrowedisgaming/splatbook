@@ -109,6 +109,29 @@ describe('applying a command', () => {
 		expect(await eventsSince(db, tableId, 0)).toHaveLength(1);
 	});
 
+	it('loses the same way when the row its caller loaded has gone stale', async () => {
+		// The caller read the table, and then somebody else's command landed.
+		const loaded = (await getCardTable(db, tableId))!;
+		await run({ requestHash: 'a' });
+
+		const loser = await run({ requestHash: 'b', expectedVersion: 0, loaded });
+		expect(loser).toMatchObject({ ok: false, reason: 'conflict' });
+		expect((await getCardTable(db, tableId))?.state).toEqual({ moves: 1 });
+		expect(await eventsSince(db, tableId, 0)).toHaveLength(1);
+		// And its claim is released, so the client's retry is not locked out.
+		expect(await findByRequest(db, tableId, 'b')).toBeUndefined();
+	});
+
+	it('reads the stored row when the one it was handed is at another version', async () => {
+		const loaded = (await getCardTable(db, tableId))!;
+		await run({ requestHash: 'a' });
+
+		// The client has caught up to version 1; the caller's row has not.
+		const second = await run({ requestHash: 'b', expectedVersion: 1, loaded });
+		expect(second.ok).toBe(true);
+		expect((await getCardTable(db, tableId))?.state).toEqual({ moves: 2 });
+	});
+
 	it('passes a refusal through without writing', async () => {
 		const res = await run({}, () => ({ ok: false, reason: 'no-such-zone' }));
 		expect(res).toEqual({ ok: false, reason: 'rejected', detail: 'no-such-zone' });
