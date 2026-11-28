@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a command reduces from the table the request has already loaded, when the
     client is up to date, instead of reading and migrating it a second time;
   - saving the new state no longer hands the whole state back to be parsed
-    again.
+    again;
+  - the reply carries the event the command just wrote, instead of reading it
+    back from the log.
 
 - **A fresh Worker's first request is light enough for Workers Free.** Session
   14's 1102 was most likely a new isolate's first request: Wrangler's bundle

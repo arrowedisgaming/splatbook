@@ -76,7 +76,10 @@ export const POST: RequestHandler = async ({ locals, params, request, fetch }) =
 		...(await viewFor(
 			locals.db,
 			{ ...table, row: result.table, state: result.state ?? table.state },
-			parsed.data.expectedVersion
+			parsed.data.expectedVersion,
+			// A command that has just landed is the whole of the news since the
+			// client's cursor. A replay is an older event, so its history is read.
+			result.replayed ? undefined : result.event
 		))
 	});
 };

@@ -246,6 +246,40 @@ describe('what a viewer is handed', () => {
 		expect(JSON.stringify(view)).not.toContain('swords-ace');
 	});
 
+	it('hands back the event a command just wrote without asking the log for it', async () => {
+		const ctx = (await load(packFetch()))!;
+		const res = await runCommand(
+			db,
+			ctx,
+			{ type: 'move', from: { zone: 'deck:player' }, to: 'discard:player' },
+			0,
+			'req-1',
+			seededRng(1)
+		);
+		if (!res.ok) throw new Error(res.reason);
+		const after = { ...ctx, row: res.table, state: res.state ?? ctx.state };
+
+		const asked = await viewFor(db, after, 0);
+		statements.length = 0;
+		const told = await viewFor(db, after, 0, res.event);
+		expect(statements).toEqual([]);
+		// The same answer the log gives, which is the point of being allowed to skip it.
+		expect(told).toEqual(asked);
+		expect(told.events).toEqual([{ version: 1, kind: 'move', data: res.event.data }]);
+	});
+
+	it('reads the log when the event in hand is not the whole of the news', async () => {
+		const ctx = (await load(packFetch()))!;
+		const move = { type: 'move', from: { zone: 'deck:player' }, to: 'discard:player' };
+		const first = await runCommand(db, ctx, move, 0, 'a', seededRng(1));
+		const second = await runCommand(db, ctx, move, 1, 'b', seededRng(1));
+		if (!first.ok || !second.ok) throw new Error('refused');
+		const after = { ...ctx, row: second.table, state: second.state ?? ctx.state };
+
+		// A client two versions behind is owed both events, not only the last.
+		expect((await viewFor(db, after, 0, second.event)).events).toHaveLength(2);
+	});
+
 	it('carries the version a client should send back as its cursor', async () => {
 		const ctx = (await load(packFetch()))!;
 		expect((await viewFor(db, ctx, 0)).version).toBe(ctx.row.version);

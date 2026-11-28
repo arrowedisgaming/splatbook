@@ -35,7 +35,7 @@ import { applyCommand, eventsSince } from '../db/card-table-commands';
  * repeatability is the whole point.
  */
 const cryptoRng = (): number => crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32;
-import type { CardTableRow, CardTableSeat } from '../db/schema';
+import type { CardTableEvent, CardTableRow, CardTableSeat } from '../db/schema';
 import type { SeatClaim } from '$lib/seat-claims';
 
 /** A game that has a table, or nothing. */
@@ -205,8 +205,25 @@ export interface TableView {
 	stamp: string;
 }
 
-export async function viewFor(db: Db, ctx: TableContext, sinceVersion: number): Promise<TableView> {
-	const events = await eventsSince(db, ctx.row.id, sinceVersion);
+/**
+ * The view a seat is handed, with the public history since its cursor.
+ *
+ * `landed` is for the request that has just run a command. A client that was
+ * up to date sent the version it held, the command took the table one past
+ * it, and the only event after that cursor is the one the command wrote, which
+ * the caller is holding. Asking the log for it was a query to be told what was
+ * already known (issue #2). Everybody else's history is read from the log.
+ */
+export async function viewFor(
+	db: Db,
+	ctx: TableContext,
+	sinceVersion: number,
+	landed?: CardTableEvent
+): Promise<TableView> {
+	const events =
+		landed && landed.version === sinceVersion + 1 && landed.version === ctx.row.version
+			? [landed]
+			: await eventsSince(db, ctx.row.id, sinceVersion);
 	return {
 		version: ctx.row.version,
 		state: ctx.module.project(ctx.state, ctx.seat?.id ?? null),
