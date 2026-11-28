@@ -21,7 +21,9 @@
 import { and, asc, eq, gt } from 'drizzle-orm';
 import type { Db } from './entities.ts';
 import { cardTableEvents, type CardTableEvent, type CardTableRow } from './schema.ts';
-import { getCardTable, saveTableState, type SaveRefusal } from './card-tables.ts';
+import { getCardTable, isExpired, TABLE_RETENTION_MS, type SaveRefusal } from './card-tables.ts';
+import { isUniqueViolation, runAtomic } from './atomic.ts';
+import { MAX_COMMANDS_PER_TABLE } from '../../card-table-limits.ts';
 
 /**
  * What a game's reducer hands back: the state after the command, and the public
@@ -76,7 +78,16 @@ export interface ApplyCommandInput {
 	loaded?: { table: CardTableRow; prior?: CardTableEvent | null };
 }
 
-/** A claimed-but-not-yet-finished event carries this instead of a version. */
+/**
+ * The version of an event whose command never finished being written.
+ *
+ * Nothing writes these any more. Commands used to claim their request hash by
+ * inserting the event first, with this in place of a version, and stamp the
+ * real one afterwards; a Worker that died between the two left the claim
+ * behind. A table that was played under that code may still hold one, so the
+ * readers below go on treating it as what it is: not part of anyone's history,
+ * and not a settled answer to a retry.
+ */
 const UNWRITTEN = 0;
 
 /**
@@ -88,17 +99,31 @@ const UNWRITTEN = 0;
  * loop does — could slip between another copy's check and its write, and the
  * command would apply twice. Two cards moved for one click.
  *
- * So the hash is *claimed* first, by inserting the event before the state is
- * written. The unique index makes that claim atomic without a transaction,
- * which matters because this codebase avoids them so the same code runs on
- * better-sqlite3 and on D1. Whoever wins the claim owns the command; whoever
- * loses is told to re-sync. If the write then fails, the claim is released so a
- * legitimate retry is not locked out by its own earlier attempt.
+ * So the lookup is only a shortcut to the answer for a command that has
+ * already run. What stops a second copy is the unique index on the event's
+ * request hash, and the event is written **in the same transaction as the
+ * state** (`runAtomic`). Both or neither:
+ *
+ * - The event is inserted only if the table is still at the version the client
+ *   expects, still inside its retention window and still under its command
+ *   ceiling. The state is saved under the same condition. Somebody else's
+ *   command landing first makes both match nothing, and nothing is written.
+ * - If the same request hash has landed in the meantime, the table has moved
+ *   on and both match nothing, or (should the versions happen to agree) the
+ *   index refuses the event and undoes the whole unit. Either way the caller
+ *   is given that earlier run's answer.
+ *
+ * An earlier version did this in three separate writes, claiming the hash
+ * first and releasing the claim if the save lost, because this codebase
+ * avoided transactions. That was three trips to D1 for every command (issue
+ * #2). It also had a state this one cannot reach: a claim with no command
+ * behind it, left by a request that stopped between its writes.
  */
 export async function applyCommand(
 	db: Db,
 	input: ApplyCommandInput,
-	reduce: (state: unknown) => CommandOutcome
+	reduce: (state: unknown) => CommandOutcome,
+	now: number = Date.now()
 ): Promise<ApplyResult> {
 	const loaded = input.loaded;
 	if (loaded?.prior) return replayOf(loaded.table, loaded.prior);
@@ -111,62 +136,142 @@ export async function applyCommand(
 		current?.prior === null ? undefined : await findByRequest(db, input.tableId, input.requestHash);
 	if (existing) return replayOf(table, existing);
 
-	// Reduce before claiming: the reducer is pure, so a refusal costs nothing
-	// and must not leave a claim behind.
+	// The reducer is pure, so a refusal costs nothing and writes nothing.
 	const outcome = reduce(table.state);
 	if (!outcome.ok) return { ok: false, reason: 'rejected', detail: outcome.reason };
 
-	let claim: CardTableEvent;
-	try {
-		[claim] = await db
-			.insert(cardTableEvents)
-			.values({
-				tableId: input.tableId,
-				version: UNWRITTEN,
-				actorSeatId: input.actorSeatId,
-				kind: outcome.kind,
-				data: outcome.data ?? {},
-				requestHash: input.requestHash
-			})
-			.returning();
-	} catch {
-		// Somebody else holds this command. Whatever they are doing with it, this
-		// caller's answer is to look again rather than to apply it a second time.
-		const theirs = await findByRequest(db, input.tableId, input.requestHash);
-		return theirs ? replayOf(table, theirs) : { ok: false, reason: 'conflict' };
-	}
+	// The event's version is the version the write produces, so a client's
+	// cursor is simply the version it already holds — one counter, not two.
+	const event: CardTableEvent = {
+		id: crypto.randomUUID(),
+		tableId: input.tableId,
+		version: input.expectedVersion + 1,
+		actorSeatId: input.actorSeatId,
+		kind: outcome.kind,
+		data: outcome.data ?? {},
+		requestHash: input.requestHash,
+		createdAt: new Date(now)
+	};
 
-	const saved = await saveTableState(
-		db,
+	// What both writes insist on. An expired table cannot be written back to
+	// life, and a table at its ceiling has accepted all the commands it will.
+	const stillThere = [
 		input.tableId,
 		input.expectedVersion,
-		outcome.state,
-		outcome.stateVersion
-	);
-	if (!saved.ok) {
-		// Release the claim, or a client retrying after losing a race would find
-		// its own abandoned attempt and believe the command had landed.
-		await db.delete(cardTableEvents).where(eq(cardTableEvents.id, claim.id));
-		return { ok: false, reason: saved.reason };
+		now - TABLE_RETENTION_MS,
+		MAX_COMMANDS_PER_TABLE
+	] as const;
+
+	let changed: number[];
+	try {
+		changed = await runAtomic(db, [
+			{
+				sql: `INSERT INTO card_table_events
+					(id, table_id, version, actor_seat_id, kind, data, request_hash, created_at)
+					SELECT ?, ?, ?, ?, ?, ?, ?, ?
+					WHERE EXISTS (
+						SELECT 1 FROM card_tables
+						WHERE id = ? AND version = ? AND last_active_at >= ? AND command_count < ?
+					)`,
+				params: [
+					event.id,
+					event.tableId,
+					event.version,
+					event.actorSeatId,
+					event.kind,
+					JSON.stringify(event.data),
+					event.requestHash,
+					now,
+					...stillThere
+				]
+			},
+			{
+				// The count is incremented in SQL rather than read and written back,
+				// so it cannot be wrong about a command it did not see.
+				sql: `UPDATE card_tables
+					SET state = ?, state_version = ?, version = ?,
+						command_count = command_count + 1, last_active_at = ?
+					WHERE id = ? AND version = ? AND last_active_at >= ? AND command_count < ?`,
+				params: [
+					JSON.stringify(outcome.state),
+					outcome.stateVersion,
+					event.version,
+					now,
+					...stillThere
+				]
+			}
+		]);
+	} catch (cause) {
+		if (!isUniqueViolation(cause)) throw cause;
+		// The index refused the event: this request has already landed, and
+		// nothing of this attempt was written. The answer is that run's.
+		return (await earlierRun(db, input, table)) ?? { ok: false, reason: 'conflict' };
 	}
 
-	// The event's version is the version the write produced, so a client's
-	// cursor is simply the version it already holds — one counter, not two.
-	const [event] = await db
-		.update(cardTableEvents)
-		.set({ version: saved.table.version })
-		.where(eq(cardTableEvents.id, claim.id))
-		.returning();
+	if (changed[1] !== 1) {
+		// The table was not where both writes needed it to be. If that is because
+		// this same request got there first, from another copy of it, the caller
+		// is owed that run's answer and not a refusal.
+		return (
+			(await earlierRun(db, input, table)) ?? {
+				ok: false,
+				reason: await whyNot(db, input.tableId, now)
+			}
+		);
+	}
 
-	return { ok: true, table: saved.table, event, replayed: false };
+	return {
+		ok: true,
+		// The row as the write left it, put together from what is in hand. Asking
+		// the database to send it back would mean parsing the whole state again.
+		table: {
+			...table,
+			state: outcome.state,
+			stateVersion: outcome.stateVersion,
+			version: event.version,
+			commandCount: table.commandCount + 1,
+			lastActiveAt: new Date(now)
+		},
+		event,
+		replayed: false
+	};
+}
+
+/** The settled answer of a run of this request that landed before this one. */
+async function earlierRun(
+	db: Db,
+	input: ApplyCommandInput,
+	table: CardTableRow
+): Promise<ApplyResult | undefined> {
+	const theirs = await findByRequest(db, input.tableId, input.requestHash);
+	return theirs ? replayOf(table, theirs) : undefined;
 }
 
 /**
- * The answer for a command somebody has already run — or is still running.
+ * Why a command's writes matched nothing.
  *
- * An event with no version yet is a claim in flight: its owner has not finished
- * writing, so there is no settled answer to give and the honest reply is that
- * this caller should re-sync.
+ * Three different conditions look the same from the write, and a caller has to
+ * tell them apart. Losing a race is normal — the client re-syncs and carries
+ * on, which is the "someone got there first" this design accepts as its only
+ * ordinary refusal. A table that has expired or exhausted its commands is
+ * *finished*, and a client unable to tell the difference would retry it
+ * forever. So a failed write spends one read to say which it was, on the path
+ * where being wrong is expensive and being slow costs nothing.
+ */
+async function whyNot(db: Db, tableId: string, now: number): Promise<SaveRefusal> {
+	const current = await getCardTable(db, tableId);
+	if (!current) return 'gone';
+	if (isExpired(current, now)) return 'expired';
+	if (current.commandCount >= MAX_COMMANDS_PER_TABLE) return 'exhausted';
+	return 'conflict';
+}
+
+/**
+ * The answer for a command somebody has already run.
+ *
+ * An event with no version is a claim that older code left unfinished (see
+ * `UNWRITTEN`): there is no settled answer to give, and the honest reply is
+ * that this caller should re-sync.
  */
 function replayOf(table: CardTableRow, event: CardTableEvent): ApplyResult {
 	if (event.version === UNWRITTEN) return { ok: false, reason: 'conflict' };
@@ -190,9 +295,8 @@ export async function findByRequest(
 /**
  * Events after a client's cursor, oldest first.
  *
- * Claims in flight are excluded: an event with no version yet is a command
- * somebody is still writing, and it has no place in a client's history until
- * it lands.
+ * Unfinished claims are excluded (see `UNWRITTEN`): an event with no version
+ * is a command that never landed, and it has no place in a client's history.
  *
  * Capped, because a client returning to a long-running table should be given
  * the current state and the recent past rather than an afternoon of history it

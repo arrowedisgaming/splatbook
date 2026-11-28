@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#2](https://github.com/blockbeard/splatbook/issues/2)). Commands were
   usually 11 ms of CPU on Cloudflare against Workers Free's 10 ms, and close to
   half of that was the database layer: eight queries, with the table's state
-  parsed three times. So far:
+  parsed three times. Now:
   - a command reduces from the table the request has already loaded, when the
     client is up to date, instead of reading and migrating it a second time;
   - saving the new state no longer hands the whole state back to be parsed
@@ -30,7 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     one trip to D1 (`readTogether`, after guild-book's `readIndependently`),
     not three. A table page and a picture upload load their table the same way.
 
-  That is four trips to the database for a command, down from eight.
+  - the event and the new state are written together, as one transaction in
+    one trip (`runAtomic`, also after guild-book), instead of as three writes
+    with a claim row held between them. The statements are plain SQL sent to
+    the driver, so drizzle builds and maps nothing for them. A command that
+    loses a race, or whose table has expired or reached its ceiling, now
+    writes nothing at all; before, it wrote a claim and deleted it.
+
+  That is two trips to the database for a command, down from eight.
   `src/lib/server/card-tables/d1.test.ts` runs the table against a real local
   D1 and holds the count as a budget; set `NO_WORKERD=1` to skip it where
   workerd cannot run.

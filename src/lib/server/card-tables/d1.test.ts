@@ -155,12 +155,12 @@ describe.skipIf(process.env.NO_WORKERD === '1')('the card table on D1', () => {
 		expect(trips).toEqual([2]);
 	});
 
-	it('runs a command in four trips: the reads together, then the three writes', async () => {
+	it('runs a command in two trips: the reads together, then the writes together', async () => {
 		const { result, view } = await command(0, 'request-1');
 		expect(result.ok).toBe(true);
 		expect(view?.version).toBe(1);
 		expect(view?.events).toEqual([{ version: 1, kind: 'move', data: expect.anything() }]);
-		expect(trips).toEqual([3, 1, 1, 1]);
+		expect(trips).toEqual([3, 2]);
 
 		// And it is what a poll then finds.
 		const polled = await syncTable(db, packFetch, token, gmClaim, undefined, { since: 0 });
@@ -174,6 +174,30 @@ describe.skipIf(process.env.NO_WORKERD === '1')('the card table on D1', () => {
 		expect(result).toMatchObject({ ok: true, replayed: true });
 		expect(view?.version).toBe(1);
 		expect(trips).toEqual([3, 1]);
+	});
+
+	it('gives a request that landed after it was looked for its earlier answer', async () => {
+		const stale = (await loadTable(db, packFetch, token, gmClaim, undefined, 'request-1'))!;
+		await command(0, 'request-1');
+
+		const late = await runCommand(db, stale, MOVE, 0, 'request-1', seededRng(1));
+		expect(late).toMatchObject({ ok: true, replayed: true });
+		const polled = await syncTable(db, packFetch, token, gmClaim, undefined, { since: 0 });
+		expect(polled).toMatchObject({ version: 1 });
+	});
+
+	it('undoes both writes when the unique index refuses the event', async () => {
+		// The one case only the index catches: the request has landed, the row in
+		// hand is the one it left, and the lookup still said it was new. D1 has to
+		// take the state back along with the event it refused.
+		await command(0, 'request-1');
+		const ctx = (await loadTable(db, packFetch, token, gmClaim, undefined))!;
+
+		const late = await runCommand(db, { ...ctx, prior: null }, MOVE, 1, 'request-1', seededRng(1));
+		expect(late).toMatchObject({ ok: true, replayed: true });
+		const polled = await syncTable(db, packFetch, token, gmClaim, undefined, { since: 0 });
+		expect(polled).toMatchObject({ version: 1 });
+		expect((polled as { events: unknown[] }).events).toHaveLength(1);
 	});
 
 	it('turns away a command built on a version somebody has moved past', async () => {

@@ -19,7 +19,7 @@
  * Server-only.
  */
 
-import { and, asc, count, desc, eq, getTableColumns, gte, inArray, lt, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, inArray, lt } from 'drizzle-orm';
 import type { Db } from './entities.ts';
 import {
 	cardTableEvents,
@@ -30,7 +30,7 @@ import {
 	type CardTableSeat
 } from './schema.ts';
 import { readTogether } from './read-together.ts';
-import { MAX_COMMANDS_PER_TABLE, MAX_TABLES_PER_OWNER } from '../../card-table-limits.ts';
+import { MAX_TABLES_PER_OWNER } from '../../card-table-limits.ts';
 
 /** Six weeks, in milliseconds — the retention window, matching Crawlspace. */
 export const TABLE_RETENTION_MS = 42 * 24 * 60 * 60 * 1000;
@@ -412,27 +412,10 @@ export async function listSeats(db: Db, tableId: string): Promise<CardTableSeat[
 }
 
 /**
- * Persist a new state blob, bumping the version.
+ * Why a table's state could not be saved.
  *
- * The version is the optimistic-concurrency counter: a caller passes the
- * version it believed it was working from, and a write against a stale version
- * fails rather than clobbering whoever got there first. That is the whole
- * mechanism behind "someone got there first" being the only refusal this design
- * has, and it is enforced by the WHERE clause rather than by a read-then-write.
- *
- * The command ceiling rides in the same clause. A very long session is a few
- * thousand card moves; a hundred thousand is unreachable by play and reachable
- * by a script, so a table that meets it stops accepting rather than growing
- * without end. Nobody at a real table will ever see it.
- *
- * **Why this returns a reason rather than nothing.** Three different conditions
- * make the same UPDATE match no rows, and a caller has to tell them apart.
- * Losing a race is normal — the client re-syncs and carries on, which is the
- * "someone got there first" this design accepts as its only refusal. A table
- * that has expired or exhausted its commands is *finished*, and a client unable
- * to tell the difference would retry it forever. So a failed write spends one
- * extra read to say which it was, on the path where being wrong is expensive
- * and being slow costs nothing.
+ * The saving itself is `applyCommand`'s, in `card-table-commands.ts`, where the
+ * state and the event that describes the change are written as one unit.
  */
 export type SaveRefusal =
 	/** Somebody else's command landed first. Re-sync and try again. */
@@ -443,58 +426,3 @@ export type SaveRefusal =
 	| 'expired'
 	/** It has accepted all the commands it ever will. */
 	| 'exhausted';
-
-export type SaveResult = { ok: true; table: CardTableRow } | { ok: false; reason: SaveRefusal };
-
-/**
- * Every column of a table but its state, for a write to hand back.
- *
- * The caller of `saveTableState` is holding the state it just asked to have
- * stored. Returning the whole row made the database serialise that blob again
- * and the driver parse it again, on every command, to produce an object equal
- * to the one already in hand (issue #2).
- */
-const { state: _unreturned, ...savedColumns } = getTableColumns(cardTables);
-void _unreturned;
-
-export async function saveTableState(
-	db: Db,
-	id: string,
-	expectedVersion: number,
-	state: unknown,
-	stateVersion: number,
-	now: number = Date.now()
-): Promise<SaveResult> {
-	const [row] = await db
-		.update(cardTables)
-		.set({
-			state,
-			stateVersion,
-			version: expectedVersion + 1,
-			// Incremented in SQL rather than read-then-written, so two commands
-			// landing together cannot both write the same count back.
-			commandCount: sql`${cardTables.commandCount} + 1`,
-			lastActiveAt: new Date(now)
-		})
-		.where(
-			and(
-				eq(cardTables.id, id),
-				eq(cardTables.version, expectedVersion),
-				// An expired table cannot be written back to life. Without this, a
-				// client holding an id and a version could resurrect a table every
-				// read path already treats as gone.
-				gte(cardTables.lastActiveAt, new Date(now - TABLE_RETENTION_MS)),
-				lt(cardTables.commandCount, MAX_COMMANDS_PER_TABLE)
-			)
-		)
-		.returning(savedColumns);
-	if (row) return { ok: true, table: { ...row, state } };
-
-	// Nothing matched. One read to say why, so a caller can tell a race worth
-	// retrying from a table it should stop asking about.
-	const current = await getCardTable(db, id);
-	if (!current) return { ok: false, reason: 'gone' };
-	if (isExpired(current, now)) return { ok: false, reason: 'expired' };
-	if (current.commandCount >= MAX_COMMANDS_PER_TABLE) return { ok: false, reason: 'exhausted' };
-	return { ok: false, reason: 'conflict' };
-}

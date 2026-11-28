@@ -10,7 +10,14 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { migrate } from 'drizzle-orm/better-sqlite3/migrator';
 import * as schema from './schema.ts';
 import type { Db } from './entities.ts';
-import { createCardTable, getCardTable } from './card-tables.ts';
+import { eq } from 'drizzle-orm';
+import {
+	createCardTable,
+	getCardTable,
+	TABLE_RETENTION_MS,
+	touchCardTable
+} from './card-tables.ts';
+import { MAX_COMMANDS_PER_TABLE } from '../../card-table-limits.ts';
 import {
 	applyCommand,
 	eventsSince,
@@ -118,7 +125,7 @@ describe('applying a command', () => {
 		expect(loser).toMatchObject({ ok: false, reason: 'conflict' });
 		expect((await getCardTable(db, tableId))?.state).toEqual({ moves: 1 });
 		expect(await eventsSince(db, tableId, 0)).toHaveLength(1);
-		// And its claim is released, so the client's retry is not locked out.
+		// And nothing of it was written, so the client's retry is not locked out.
 		expect(await findByRequest(db, tableId, 'b')).toBeUndefined();
 	});
 
@@ -161,6 +168,23 @@ describe('applying a command', () => {
 		});
 		expect(late).toMatchObject({ ok: true, replayed: true });
 		expect((await getCardTable(db, tableId))?.state).toEqual({ moves: 1 });
+		expect(await eventsSince(db, tableId, 0)).toHaveLength(1);
+	});
+
+	it('is stopped by the index when the lookup and the version both miss it', async () => {
+		// The request has landed, the caller's row is the one it left behind, and
+		// the caller was still told the request was new. Only the index is left.
+		await run({ requestHash: 'a' });
+		const table = (await getCardTable(db, tableId))!;
+
+		const late = await run({
+			requestHash: 'a',
+			expectedVersion: 1,
+			loaded: { table, prior: null }
+		});
+		expect(late).toMatchObject({ ok: true, replayed: true });
+		// The refused event took the state with it: nothing moved.
+		expect(await getCardTable(db, tableId)).toEqual(table);
 		expect(await eventsSince(db, tableId, 0)).toHaveLength(1);
 	});
 
@@ -208,6 +232,74 @@ describe('applying a command', () => {
 	});
 });
 
+describe('what a write insists on', () => {
+	it('bumps the version, counts the command, and hands back the row as it now is', async () => {
+		const res = await run();
+		if (!res.ok) throw new Error(res.reason);
+		expect(res.table.version).toBe(1);
+		expect(res.table.commandCount).toBe(1);
+		expect(res.table.state).toEqual({ moves: 1 });
+		// Nothing is read back after the write, so the row and the event handed
+		// to the caller are put together from what was in hand. They have to be
+		// what the database holds.
+		expect(res.table).toEqual(await getCardTable(db, tableId));
+		expect(res.event).toEqual(await findByRequest(db, tableId, 'r1'));
+	});
+
+	it('counts each command once, however many land', async () => {
+		for (let i = 0; i < 5; i++) {
+			const res = await run({ expectedVersion: i, requestHash: `r${i}` });
+			if (!res.ok) throw new Error(res.reason);
+		}
+		const current = await getCardTable(db, tableId);
+		expect(current?.version).toBe(5);
+		expect(current?.commandCount).toBe(5);
+		expect((await eventsSince(db, tableId, 0)).map((e) => e.version)).toEqual([1, 2, 3, 4, 5]);
+	});
+
+	it('keeps a table alive by being used', async () => {
+		await touchCardTable(db, tableId, Date.now() - 60_000);
+		const before = (await getCardTable(db, tableId))!.lastActiveAt.getTime();
+		await run();
+		expect((await getCardTable(db, tableId))!.lastActiveAt.getTime()).toBeGreaterThan(before);
+	});
+
+	it('cannot write an expired table back to life', async () => {
+		await touchCardTable(db, tableId, Date.now() - TABLE_RETENTION_MS - 1000);
+		// Every read path already treats this table as gone; a client still
+		// holding its id and version must not be able to resurrect it.
+		expect(await run()).toEqual({ ok: false, reason: 'expired' });
+		expect((await getCardTable(db, tableId))?.version).toBe(0);
+		expect(await findByRequest(db, tableId, 'r1')).toBeUndefined();
+	});
+
+	it('stops accepting commands at the ceiling', async () => {
+		// Reach the ceiling directly; playing there would take a hundred thousand
+		// card moves, which is the point of the number.
+		await db
+			.update(schema.cardTables)
+			.set({ commandCount: MAX_COMMANDS_PER_TABLE })
+			.where(eq(schema.cardTables.id, tableId));
+		// Distinguishable from a race, because a client that could not tell would
+		// retry a finished table forever.
+		expect(await run()).toEqual({ ok: false, reason: 'exhausted' });
+		expect(await findByRequest(db, tableId, 'r1')).toBeUndefined();
+	});
+
+	it('says a table deleted under it is gone, not merely contended', async () => {
+		const table = (await getCardTable(db, tableId))!;
+		await db.delete(schema.cardTables).where(eq(schema.cardTables.id, tableId));
+		expect(await run({ loaded: { table, prior: null } })).toEqual({ ok: false, reason: 'gone' });
+	});
+
+	it('lets a failure that is not a lost race be a failure', async () => {
+		// A seat that does not exist breaks the event's foreign key. That is not
+		// "somebody got there first", and must not be reported as if it were.
+		await expect(run({ actorSeatId: 'no-such-seat' })).rejects.toThrow(/foreign key/i);
+		expect((await getCardTable(db, tableId))?.version).toBe(0);
+	});
+});
+
 describe('the request hash is a lock, not a lookup', () => {
 	it('will not apply a command twice when a retry arrives with a fresh version', async () => {
 		// The window a check-then-apply would leave: a naive retry-on-conflict
@@ -226,7 +318,7 @@ describe('the request hash is a lock, not a lookup', () => {
 		expect(table?.version).toBe(1);
 	});
 
-	it('releases the claim when the write loses its race', async () => {
+	it('leaves nothing behind when the write loses its race', async () => {
 		// Otherwise a client retrying after a conflict would meet its own
 		// abandoned attempt and believe the command had landed.
 		await run({ requestHash: 'winner' });
